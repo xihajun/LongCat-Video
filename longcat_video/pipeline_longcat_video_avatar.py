@@ -1440,6 +1440,27 @@ class LongCatVideoAvatarPipeline:
                 audio_embs=audio_emb, num_cond_latents=num_cond_latents, num_ref_latents=num_ref_latents, ref_img_index=ref_img_index)
             kv_cache_dict = self._get_kv_cache_dict()
             latents = latents[:, :, num_cond_latents:]
+            if offload_kv_cache:
+                # `offload_kv_cache=True` was needed so the KV-cache BUILD graph
+                # (which needs ~8.5GB/chip of transient runtime buffers, see
+                # run_kaggle_tpu_v5e8.py's --offload_kv_cache help) doesn't OOM
+                # a 16GB TPU chip. But every block's forward does
+                # `kv_cache[0].to(x.device)` (longcat_video_dit_avatar.py), so
+                # leaving kv_cache_dict as CPU tensors re-uploads the ENTIRE
+                # cache from host to device on every one of the
+                # num_inference_steps denoise steps, for every block -- the
+                # cache itself never changes within a segment. That redundant
+                # host<->device traffic (not compute) is why steady-state
+                # denoise steps are much slower than the compute-only estimate.
+                # The build graph has already finished and released its peak
+                # buffers by this point, and the resulting cache (~1GB/chip,
+                # already budgeted for in the steady-state HBM estimate) fits
+                # fine resident on-device for the remaining steps of this
+                # segment -- so upload it ONCE here instead of once per step.
+                kv_cache_dict = {
+                    k: (v0.to(device), v1.to(device))
+                    for k, (v0, v1) in kv_cache_dict.items()
+                }
         else:
             kv_cache_dict = {}
 
@@ -1556,6 +1577,15 @@ class LongCatVideoAvatarPipeline:
 
         self._current_timestep = None
 
+        if use_kv_cache:
+            # Free the on-device KV cache (~1GB/chip) BEFORE VAE decode: the
+            # decode program needs its own ~4.7G/chip runtime reservation at
+            # load time, and with the cache still resident only ~3.8G is free
+            # -> RESOURCE_EXHAUSTED. The cache is rebuilt from cond latents at
+            # the start of every segment, so dropping it here loses nothing.
+            kv_cache_dict = None
+            self._clear_cache()
+
         if output_type == 'latent':
             return latents
         
@@ -1597,4 +1627,3 @@ class LongCatVideoAvatarPipeline:
         if self.vae is not None:
             self.vae = self.vae.to(device, non_blocking=True)
         return self
-    

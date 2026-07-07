@@ -21,6 +21,29 @@ Or for quick UI test without accelerator:
     !python gradio_server.py --dummy
 """
 
+# numpy compatibility patch for librosa/numba on newer numpy
+import numpy as _np
+if not hasattr(_np, "row_stack"):
+    _np.row_stack = _np.vstack
+if not hasattr(_np, "trapz"):
+    _np.trapz = _np.trapezoid
+if not hasattr(_np, "in1d"):
+    _np.in1d = lambda ar1, ar2, assume_unique=False, invert=False, kind=None: _np.isin(
+        ar1, ar2, assume_unique=assume_unique, invert=invert, kind=kind
+    )
+if not hasattr(_np, "complex"):
+    _np.complex = complex
+if not hasattr(_np, "float"):
+    _np.float = float
+if not hasattr(_np, "int"):
+    _np.int = int
+if not hasattr(_np, "bool"):
+    _np.bool = bool
+if not hasattr(_np, "object"):
+    _np.object = object
+if not hasattr(_np, "str"):
+    _np.str = str
+
 import os
 import sys
 os.environ.setdefault("TRANSFORMERS_NO_TF", "1")
@@ -1040,6 +1063,196 @@ def _dummy_generate(image, audio_path, prompt, resolution, num_segments, seed, p
 
 
 # ---------------------------------------------------------------------------
+# Session persistence — per-session-ID dirs, survive tunnel drops / reloads
+# ---------------------------------------------------------------------------
+SESSION_ROOT = ("/kaggle/working/gradio_sessions"
+                if os.path.isdir("/kaggle/working") else "/tmp/gradio_sessions")
+
+
+def _new_session_id():
+    return time.strftime("%m%d-%H%M%S") + "-" + str(random.randint(100, 999))
+
+
+def _session_dir(sid):
+    d = os.path.join(SESSION_ROOT, sid)
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _session_path(sid, name):
+    return os.path.join(_session_dir(sid), name)
+
+
+def _latest_session_id():
+    if not os.path.isdir(SESSION_ROOT):
+        return None
+    dirs = [p for p in Path(SESSION_ROOT).iterdir() if p.is_dir()]
+    if not dirs:
+        return None
+    return max(dirs, key=lambda p: p.stat().st_mtime).name
+
+
+def _session_save_json(sid, **kwargs):
+    """Merge kwargs into <session>/session.json."""
+    path = _session_path(sid, "session.json")
+    data = {}
+    if os.path.exists(path):
+        try:
+            with open(path) as f:
+                data = json.load(f)
+        except Exception:
+            data = {}
+    data.update(kwargs)
+    with open(path, "w") as f:
+        json.dump(data, f)
+
+
+def _session_load_json(sid):
+    path = _session_path(sid, "session.json")
+    if os.path.exists(path):
+        try:
+            with open(path) as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+
+def _session_save_image(sid, img):
+    if not sid:
+        return
+    try:
+        p = _session_path(sid, "image.png")
+        if img is None:
+            if os.path.exists(p):
+                os.remove(p)
+        else:
+            img.save(p)
+    except Exception as e:
+        print(f"[session] image save failed: {e}", flush=True)
+
+
+def _session_save_audio(sid, audio_path):
+    if not sid:
+        return
+    try:
+        # remove any previous audio.* file
+        for old in Path(_session_dir(sid)).glob("audio.*"):
+            old.unlink(missing_ok=True)
+        if audio_path and os.path.exists(audio_path):
+            p = _session_path(sid, "audio" + (os.path.splitext(audio_path)[1] or ".wav"))
+            shutil.copy(audio_path, p)
+            _session_save_json(sid, audio=p)
+        else:
+            _session_save_json(sid, audio=None)
+    except Exception as e:
+        print(f"[session] audio save failed: {e}", flush=True)
+
+
+# ---------------------------------------------------------------------------
+# Background jobs — generation keeps running even if the client disconnects;
+# re-attach any time with the session ID.
+# ---------------------------------------------------------------------------
+JOBS = {}  # sid -> {"status": "running"|"done"|"error", "video", "log", "segments"}
+_GEN_LOCK = threading.Lock()  # single accelerator: one generation at a time
+
+
+def _run_job(sid, image, audio_path, prompt, resolution, num_segments, seed):
+    job = JOBS[sid]
+    if _GEN_LOCK.locked():
+        job["log"] = "[queue] another job is running, waiting for it to finish..."
+    with _GEN_LOCK:
+        try:
+            for video, log_text, segs in generate(
+                    image, audio_path, prompt, resolution, num_segments, seed):
+                job["video"], job["log"], job["segments"] = video, log_text, list(segs)
+                _session_save_json(sid, job_video=video, job_log=log_text,
+                                   job_segments=list(segs), job_status="running")
+            job["status"] = "done"
+            _session_save_json(sid, job_status="done", job_video=job["video"],
+                               job_log=job["log"], job_segments=job["segments"])
+        except Exception:
+            import traceback as _tb
+            job["log"] = (job.get("log") or "") + "\nERROR:\n" + _tb.format_exc()
+            job["status"] = "error"
+            _session_save_json(sid, job_status="error", job_log=job["log"])
+
+
+def _start_or_attach(sid, image, audio_path, prompt, resolution, num_segments, seed):
+    """Start a background generation job for this session (or attach to a
+    running one) and stream its progress. Safe to disconnect and re-attach."""
+    sid = (sid or "").strip() or _new_session_id()
+    job = JOBS.get(sid)
+    if job is None or job["status"] != "running":
+        job = {"status": "running", "video": None, "log": "", "segments": []}
+        JOBS[sid] = job
+        threading.Thread(target=_run_job, daemon=True, name=f"job-{sid}",
+                         args=(sid, image, audio_path, prompt,
+                               resolution, num_segments, seed)).start()
+    while job["status"] == "running":
+        yield job["video"], job["log"], list(job["segments"])
+        time.sleep(2)
+    yield job["video"], job["log"], list(job["segments"])
+
+
+def _restore_session(sid):
+    """Restore inputs + results for a session ID; if its job is still running,
+    keep streaming progress (re-attach). Yields 9 component updates."""
+    import gradio as gr
+    sid = (sid or "").strip()
+    noop = gr.update()
+    if not sid or not os.path.isdir(os.path.join(SESSION_ROOT, sid)):
+        yield (noop,) * 8 + (gr.update(value=f"[session] '{sid}' not found"),)
+        return
+
+    data = _session_load_json(sid)
+    img_p = _session_path(sid, "image.png")
+    image = img_p if os.path.exists(img_p) else None
+    audio = data.get("audio")
+    if audio and not os.path.exists(audio):
+        audio = None
+    inputs = (
+        gr.update(value=image) if image else noop,
+        gr.update(value=audio) if audio else noop,
+        gr.update(value=data["prompt"]) if data.get("prompt") else noop,
+        gr.update(value=data["resolution"]) if data.get("resolution") else noop,
+        gr.update(value=data["segments"]) if data.get("segments") else noop,
+        gr.update(value=data["seed"]) if data.get("seed") is not None else noop,
+    )
+    no_inputs = (noop,) * 6
+
+    job = JOBS.get(sid)
+    if job and job["status"] == "running":
+        first = True
+        while job["status"] == "running":
+            yield (inputs if first else no_inputs) + (
+                gr.update(value=job["video"]) if job["video"] else noop,
+                gr.update(value=list(job["segments"])),
+                gr.update(value=job["log"]),
+            )
+            first = False
+            time.sleep(2)
+        yield no_inputs + (
+            gr.update(value=job["video"]) if job["video"] else noop,
+            gr.update(value=list(job["segments"])),
+            gr.update(value=job["log"]),
+        )
+        return
+
+    # No live job — restore last persisted results
+    video = data.get("job_video") or data.get("last_video")
+    if video and not os.path.exists(video):
+        video = None
+    segs = [s for s in (data.get("job_segments") or []) if os.path.exists(s)]
+    log_text = data.get("job_log") or f"[session] restored '{sid}'"
+    yield inputs + (
+        gr.update(value=video) if video else noop,
+        gr.update(value=segs),
+        gr.update(value=log_text),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Gradio UI
 # ---------------------------------------------------------------------------
 def build_ui():
@@ -1058,6 +1271,16 @@ def build_ui():
         status_html = gr.HTML(
             value='<div style="padding:10px 16px; border-radius:8px; background:#f0f0f0; color:#666; font-weight:bold; font-size:15px; text-align:center; border:2px solid #ddd;">Initializing...</div>'
         )
+
+        # Session bar — copy the ID; paste it back after a tunnel/URL change
+        # to restore uploads, settings and any still-running generation.
+        with gr.Row():
+            sid_box = gr.Textbox(
+                label="Session ID (保存好，换链接后粘回来可找回上传/进度/结果)",
+                value="", max_lines=1, scale=3,
+            )
+            restore_btn = gr.Button("恢复 Session", scale=1)
+            new_btn = gr.Button("新 Session", scale=1)
 
         with gr.Row():
             with gr.Column(scale=1):
@@ -1105,10 +1328,45 @@ def build_ui():
             btn_update = gr.update(interactive=(GS.ready or GS.dummy))
             return html, btn_update
 
+        _beep_html = gr.HTML("", visible=False, elem_id="beep-trigger")
+
+        # --- Session persistence: save inputs (per session ID) as they change ---
+        input_image.change(fn=_session_save_image, inputs=[sid_box, input_image])
+        input_audio.change(fn=_session_save_audio, inputs=[sid_box, input_audio])
+        prompt_text.change(fn=lambda s, v: _session_save_json(s, prompt=v) if s else None,
+                           inputs=[sid_box, prompt_text])
+        res_dd.change(fn=lambda s, v: _session_save_json(s, resolution=v) if s else None,
+                      inputs=[sid_box, res_dd])
+        seg_dd.change(fn=lambda s, v: _session_save_json(s, segments=v) if s else None,
+                      inputs=[sid_box, seg_dd])
+        seed_slider.change(fn=lambda s, v: _session_save_json(s, seed=v) if s else None,
+                           inputs=[sid_box, seed_slider])
+
+        _restore_outputs = [input_image, input_audio, prompt_text, res_dd, seg_dd,
+                            seed_slider, output_video, segment_gallery, log_box]
+
+        # On (re)load: pick up the most recent session (or create one), then
+        # restore it — including re-attaching to a still-running generation.
+        def _on_load():
+            sid = _latest_session_id() or _new_session_id()
+            _session_dir(sid)
+            print(f"[session] active session: {sid}", flush=True)
+            return sid
+
+        app.load(fn=_on_load, outputs=sid_box).then(
+            fn=_restore_session, inputs=sid_box, outputs=_restore_outputs,
+        )
+
+        restore_btn.click(fn=_restore_session, inputs=sid_box, outputs=_restore_outputs)
+        new_btn.click(fn=lambda: _new_session_id(), outputs=sid_box)
+
         generate_btn.click(
-            fn=generate,
-            inputs=[input_image, input_audio, prompt_text, res_dd, seg_dd, seed_slider],
+            fn=_start_or_attach,
+            inputs=[sid_box, input_image, input_audio, prompt_text, res_dd, seg_dd, seed_slider],
             outputs=[output_video, log_box, segment_gallery],
+        ).then(
+            fn=lambda: '<script>new Audio("data:audio/wav;base64,UklGRl9vT19XQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA=").play()</script>',
+            outputs=_beep_html,
         )
 
         # Periodic status update via Timer (Gradio 6.0+)
