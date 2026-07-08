@@ -83,7 +83,7 @@ def _parse_args(argv=None):
     p.add_argument('--vae_on_tpu', action=argparse.BooleanOptionalAction, default=True)
     p.add_argument('--vae_dtype', type=str, default='bf16', choices=['bf16', 'fp32'])
     p.add_argument('--vae_spatial_shard', action=argparse.BooleanOptionalAction, default=True)
-    p.add_argument('--vae_tiled_decode', action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument('--vae_tiled_decode', action=argparse.BooleanOptionalAction, default=True)
     p.add_argument('--sync_every_n_steps', type=int, default=1)
     p.add_argument('--runtime_scalar_fix', action=argparse.BooleanOptionalAction, default=True)
     p.add_argument('--warmup', action=argparse.BooleanOptionalAction, default=False)
@@ -356,22 +356,43 @@ def init_models_tpu(args):
                 print(f"    [vae-decode] W-sharded over {num_devices} chips (latent W {orig_latent_w}->{x.shape[-1]})", flush=True)
             torch_xla.sync()
             print(f"    [vae-decode] post_quant_conv sync {_time.time() - t0:.1f}s", flush=True)
-            outs = []
-            for i in range(num_frame):
-                step_t0 = _time.time()
-                self._conv_idx = [0]
-                if i == 0:
-                    outs.append(self.decoder(x[:, :, :1], feat_cache=self._feat_map,
-                                             feat_idx=self._conv_idx, first_chunk=True))
-                else:
-                    idx = torch.tensor([i], dtype=torch.long).to(x.device)
-                    frame = x.index_select(2, idx)
-                    outs.append(self.decoder(frame, feat_cache=self._feat_map,
-                                             feat_idx=self._conv_idx))
-                torch_xla.sync()
-                print(f"    [vae-decode] frame {i + 1}/{num_frame} sync {_time.time() - step_t0:.1f}s "
-                      f"({_time.time() - t0:.1f}s elapsed)", flush=True)
-            out = torch.cat(outs, 2)
+
+            def _decode_frames(xt, tag=""):
+                self.clear_cache()
+                outs = []
+                for i in range(num_frame):
+                    step_t0 = _time.time()
+                    self._conv_idx = [0]
+                    if i == 0:
+                        outs.append(self.decoder(xt[:, :, :1], feat_cache=self._feat_map,
+                                                 feat_idx=self._conv_idx, first_chunk=True))
+                    else:
+                        idx = torch.tensor([i], dtype=torch.long).to(xt.device)
+                        frame = xt.index_select(2, idx)
+                        outs.append(self.decoder(frame, feat_cache=self._feat_map,
+                                                 feat_idx=self._conv_idx))
+                    torch_xla.sync()
+                    print(f"    [vae-decode]{tag} frame {i + 1}/{num_frame} sync {_time.time() - step_t0:.1f}s "
+                          f"({_time.time() - t0:.1f}s elapsed)", flush=True)
+                return torch.cat(outs, 2)
+
+            latent_h = x.shape[-2]
+            if args.vae_tiled_decode and latent_h >= 32:
+                # H-tiled decode: two overlapping halves, blended along H.
+                # Halves the peak activation memory of the decode program at
+                # the cost of ~2x decode time (avoids RESOURCE_EXHAUSTED on
+                # marginal HBM headroom).
+                ov = 4  # latent-space overlap rows (-> 8*ov px blend region)
+                stride = (latent_h + 1) // 2 - ov
+                print(f"    [vae-decode] H-tiled: 2 tiles of latent H {stride + 2 * ov} (full {latent_h}, overlap {2 * ov})", flush=True)
+                out_top = _decode_frames(x[:, :, :, : stride + 2 * ov], " [tile 1/2]")
+                out_bottom = _decode_frames(x[:, :, :, stride:], " [tile 2/2]")
+                up = out_top.shape[-2] // (stride + 2 * ov)
+                out_bottom = self.blend_v(out_top, out_bottom, 2 * ov * up)
+                out = torch.cat([out_top[:, :, :, : stride * up], out_bottom], dim=-2)
+                out = out[:, :, :, : latent_h * up]
+            else:
+                out = _decode_frames(x)
             if pad_w:
                 up = out.shape[-1] // x.shape[-1]
                 out = out[..., :orig_latent_w * up]
