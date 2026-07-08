@@ -30,6 +30,13 @@ import pyloudnorm as pyln
 from diffusers.image_processor import is_valid_image, is_valid_image_imagelist
 import warnings
 
+try:
+    import torch_xla
+    import torch_xla.core.xla_model as xm
+    _HAS_XLA = True
+except ImportError:
+    _HAS_XLA = False
+
 
 def torch_gc():
     torch.cuda.empty_cache()
@@ -472,7 +479,14 @@ class LongCatVideoAvatarPipeline:
     def _clear_cache(self):
         self.kv_cache_dict = None
         gc.collect()
-        torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        if _HAS_XLA:
+            # On XLA, dropping Python refs alone does not release device
+            # buffers: pending lazy ops may still hold them. Materialize and
+            # drain so the memory is actually free (e.g. before VAE decode).
+            torch_xla.sync()
+            xm.wait_device_ops()
 
     def get_condition_shape(self, condition, resolution, scale_factor_spatial=32):
         bucket_config = get_bucket_config(resolution, scale_factor_spatial=scale_factor_spatial)

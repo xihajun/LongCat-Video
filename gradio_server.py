@@ -845,12 +845,17 @@ def generate(
         torch_gc()
 
         if n_seg > 1:
+            # Warmup AVC with the real ai2v output dims (bucket resolution),
+            # not the default height/width: otherwise the actual AVC run hits
+            # a different graph shape -> recompilation + a second resident
+            # compiled program eating HBM.
+            warm_width, warm_height = warm_video[0].size
             warm_ref_latent = warm_latent[:, :, :1].clone() if warm_latent is not None else None
             with torch.no_grad():
                 pipe.generate_avc(
-                    video=warm_video, video_latent=warm_latent if warm_latent is not None else torch.zeros(1,16,1,height//8,width//8).to(primary_dev).to(torch.bfloat16),
+                    video=warm_video, video_latent=warm_latent if warm_latent is not None else torch.zeros(1,16,1,warm_height//8,warm_width//8).to(primary_dev).to(torch.bfloat16),
                     prompt=prompt, negative_prompt=negative_prompt,
-                    height=height, width=width,
+                    height=warm_height, width=warm_width,
                     num_frames=num_frames, num_cond_frames=num_cond_frames,
                     num_inference_steps=num_inference_steps,
                     text_guidance_scale=text_guidance_scale, audio_guidance_scale=audio_guidance_scale,
