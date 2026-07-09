@@ -685,6 +685,7 @@ def generate(
     resolution: str,
     num_segments: str,
     seed: int,
+    negative_prompt: str = None,
     progress=None,
 ):
     """
@@ -698,6 +699,9 @@ def generate(
     if GS.dummy:
         yield from _dummy_generate(image, audio_path, prompt, resolution, num_segments, seed, progress)
         return
+
+    if negative_prompt is None:
+        negative_prompt = GS.negative_prompt
 
     import librosa
     from diffusers.utils import load_image
@@ -816,7 +820,6 @@ def generate(
         progress("Stage 2: Text encoding...")
     log("[stage 2] text encoding")
 
-    negative_prompt = GS.negative_prompt
     with torch.no_grad():
         pe, pm, npe, npm = pipe.encode_prompt(
             prompt=prompt, negative_prompt=negative_prompt,
@@ -1183,14 +1186,14 @@ JOBS = {}  # sid -> {"status": "running"|"done"|"error", "video", "log", "segmen
 _GEN_LOCK = threading.Lock()  # single accelerator: one generation at a time
 
 
-def _run_job(sid, image, audio_path, prompt, resolution, num_segments, seed):
+def _run_job(sid, image, audio_path, prompt, resolution, num_segments, seed, negative_prompt=None):
     job = JOBS[sid]
     if _GEN_LOCK.locked():
         job["log"] = "[queue] another job is running, waiting for it to finish..."
     with _GEN_LOCK:
         try:
             for video, log_text, segs in generate(
-                    image, audio_path, prompt, resolution, num_segments, seed):
+                    image, audio_path, prompt, resolution, num_segments, seed, negative_prompt):
                 job["video"], job["log"], job["segments"] = video, log_text, list(segs)
                 _session_save_json(sid, job_video=video, job_log=log_text,
                                    job_segments=list(segs), job_status="running")
@@ -1204,7 +1207,7 @@ def _run_job(sid, image, audio_path, prompt, resolution, num_segments, seed):
             _session_save_json(sid, job_status="error", job_log=job["log"])
 
 
-def _start_or_attach(sid, image, audio_path, prompt, resolution, num_segments, seed):
+def _start_or_attach(sid, image, audio_path, prompt, resolution, num_segments, seed, negative_prompt=None):
     """Start a background generation job for this session (or attach to a
     running one) and stream its progress. Safe to disconnect and re-attach."""
     sid = (sid or "").strip() or _new_session_id()
@@ -1214,7 +1217,7 @@ def _start_or_attach(sid, image, audio_path, prompt, resolution, num_segments, s
         JOBS[sid] = job
         threading.Thread(target=_run_job, daemon=True, name=f"job-{sid}",
                          args=(sid, image, audio_path, prompt,
-                               resolution, num_segments, seed)).start()
+                               resolution, num_segments, seed, negative_prompt)).start()
     while job["status"] == "running":
         yield job["video"], job["log"], list(job["segments"])
         time.sleep(2)
@@ -1228,7 +1231,7 @@ def _restore_session(sid):
     sid = (sid or "").strip()
     noop = gr.update()
     if not sid or not os.path.isdir(os.path.join(SESSION_ROOT, sid)):
-        yield (noop,) * 8 + (gr.update(value=f"[session] '{sid}' not found"),)
+        yield (noop,) * 9 + (gr.update(value=f"[session] '{sid}' not found"),)
         return
 
     data = _session_load_json(sid)
@@ -1244,8 +1247,9 @@ def _restore_session(sid):
         gr.update(value=data["resolution"]) if data.get("resolution") else noop,
         gr.update(value=data["segments"]) if data.get("segments") else noop,
         gr.update(value=data["seed"]) if data.get("seed") is not None else noop,
+        gr.update(value=data["negative_prompt"]) if data.get("negative_prompt") else noop,
     )
-    no_inputs = (noop,) * 6
+    no_inputs = (noop,) * 7
 
     job = JOBS.get(sid)
     if job and job["status"] == "running":
@@ -1317,6 +1321,11 @@ def build_ui():
                     value="A western man stands on stage under dramatic lighting, holding a microphone close to their mouth. Wearing a vibrant red jacket with gold embroidery, the singer is speaking while smoke swirls around them, creating a dynamic and atmospheric scene.",
                     lines=3,
                 )
+                neg_prompt_text = gr.Textbox(
+                    label="Negative Prompt",
+                    value=GS.negative_prompt,
+                    lines=3,
+                )
                 with gr.Row():
                     res_dd = gr.Dropdown(["480p", "720p"], value="480p", label="Resolution")
                     seg_dd = gr.Dropdown(["auto", "1", "2", "3", "4", "5", "6"], value="auto", label="Segments")
@@ -1367,9 +1376,11 @@ def build_ui():
                       inputs=[sid_box, seg_dd])
         seed_slider.change(fn=lambda s, v: _session_save_json(s, seed=v) if s else None,
                            inputs=[sid_box, seed_slider])
+        neg_prompt_text.change(fn=lambda s, v: _session_save_json(s, negative_prompt=v) if s else None,
+                               inputs=[sid_box, neg_prompt_text])
 
         _restore_outputs = [input_image, input_audio, prompt_text, res_dd, seg_dd,
-                            seed_slider, output_video, segment_gallery, log_box]
+                            seed_slider, neg_prompt_text, output_video, segment_gallery, log_box]
 
         # On (re)load: pick up the most recent session (or create one), then
         # restore it — including re-attaching to a still-running generation.
@@ -1388,7 +1399,7 @@ def build_ui():
 
         generate_btn.click(
             fn=_start_or_attach,
-            inputs=[sid_box, input_image, input_audio, prompt_text, res_dd, seg_dd, seed_slider],
+            inputs=[sid_box, input_image, input_audio, prompt_text, res_dd, seg_dd, seed_slider, neg_prompt_text],
             outputs=[output_video, log_box, segment_gallery],
         ).then(
             fn=lambda: '<script>new Audio("data:audio/wav;base64,UklGRl9vT19XQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA=").play()</script>',
