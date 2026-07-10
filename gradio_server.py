@@ -675,6 +675,64 @@ def extract_vocal(source_path, vocal_separator, tmp_dir):
     return target_path
 
 
+def build_ref_target_masks(bbox_p1, bbox_p2, src_w, src_h):
+    """Build [3, H, W] masks (person1, person2, background) for multitalk mode.
+
+    bbox_p1/bbox_p2: [x1, y1, x2, y2] in source-image pixels, or None.
+    When BOTH are None, falls back to the official left/right half split
+    (face_scale=0.1 margins), mirroring run_demo_avatar_multi_audio_to_video.py.
+    """
+    human_mask1 = torch.zeros([src_h, src_w])
+    human_mask2 = torch.zeros([src_h, src_w])
+    if bbox_p1 is None and bbox_p2 is None:
+        face_scale = 0.1
+        y_min, y_max = int(src_h * face_scale), int(src_h * (1 - face_scale))
+        half_w = src_w // 2
+        l_x_min, l_x_max = int(half_w * face_scale), int(half_w * (1 - face_scale))
+        r_x_min, r_x_max = l_x_min + half_w, l_x_max + half_w
+        human_mask1[y_min:y_max, l_x_min:l_x_max] = 1
+        human_mask2[y_min:y_max, r_x_min:r_x_max] = 1
+    elif bbox_p1 is not None and bbox_p2 is not None:
+        x1, y1, x2, y2 = [int(v) for v in bbox_p1]
+        human_mask1[min(y1, y2):max(y1, y2), min(x1, x2):max(x1, x2)] = 1
+        x1, y1, x2, y2 = [int(v) for v in bbox_p2]
+        human_mask2[min(y1, y2):max(y1, y2), min(x1, x2):max(x1, x2)] = 1
+    else:
+        raise ValueError("Either annotate BOTH person bboxes or none (auto left/right split).")
+    background_mask = torch.where(
+        (human_mask1 + human_mask2) > 0, torch.tensor(0.0), torch.tensor(1.0))
+    return torch.stack([human_mask1, human_mask2, background_mask], dim=0)
+
+
+def prepare_multi_audio(vocal1, vocal2, raw1_path, raw2_path, sr=16000, audio_type="para"):
+    """Port of the official audio_prepare_multi: returns (left_ext, right_ext, merged_raw).
+
+    para: both speak simultaneously -> per-person vocals as-is (padded to equal
+          length), merged audio = raw1 + raw2.
+    add : person1 speaks first, then person2 -> each vocal padded with the
+          other's silence, merged audio = sequential concatenation.
+    """
+    import librosa
+    left, _ = librosa.load(vocal1, sr=sr)
+    right, _ = librosa.load(vocal2, sr=sr)
+    raw1, _ = librosa.load(raw1_path, sr=sr)
+    raw2, _ = librosa.load(raw2_path, sr=sr)
+    if audio_type == "add":
+        left_ext = np.concatenate([left, np.zeros_like(right)])
+        right_ext = np.concatenate([np.zeros_like(left), right])
+        merged = (np.concatenate([raw1, np.zeros_like(raw2)])
+                  + np.concatenate([np.zeros_like(raw1), raw2]))
+    elif audio_type == "para":
+        n = max(len(left), len(right))
+        left_ext = np.pad(left, (0, n - len(left)))
+        right_ext = np.pad(right, (0, n - len(right)))
+        nr = max(len(raw1), len(raw2))
+        merged = np.pad(raw1, (0, nr - len(raw1))) + np.pad(raw2, (0, nr - len(raw2)))
+    else:
+        raise NotImplementedError(f"Unsupported audio_type {audio_type}")
+    return left_ext, right_ext, merged
+
+
 # ---------------------------------------------------------------------------
 # Generation (called per Gradio request)
 # ---------------------------------------------------------------------------
@@ -686,10 +744,17 @@ def generate(
     num_segments: str,
     seed: int,
     negative_prompt: str = None,
+    audio_path2: str = None,
+    audio_type: str = "para",
+    bbox: dict = None,
     progress=None,
 ):
     """
-    Run the full avatar generation pipeline.
+    Run the full avatar generation pipeline (single- or dual-speaker).
+
+    Dual-speaker (multitalk) mode activates when audio_path2 is provided:
+    two audio streams are embedded separately ([2, T, 5, D]) and bbox
+    annotations become ref_target_masks steering each voice to its region.
     Returns (video_path, log_text, segment_paths).
     """
     if not GS.ready and not GS.dummy:
@@ -776,12 +841,32 @@ def generate(
     audio_tmp_dir = Path("./audio_temp_file")
     (audio_tmp_dir / "vocals").mkdir(parents=True, exist_ok=True)
 
+    multi_mode = bool(audio_path2)
+    sr = 16000
     vocal_sep = init_vocal_separator()
     temp_vocal_path = extract_vocal(audio_path, vocal_sep, audio_tmp_dir)
     assert temp_vocal_path is not None and os.path.exists(temp_vocal_path), "No vocal detected"
 
-    speech_array, sr = librosa.load(temp_vocal_path, sr=16000)
-    source_duration = len(speech_array) / sr
+    temp_vocal_paths = [temp_vocal_path]
+    if multi_mode:
+        log(f"    [multitalk] dual-speaker mode, audio_type={audio_type}")
+        temp_vocal_path2 = extract_vocal(audio_path2, vocal_sep, audio_tmp_dir)
+        assert temp_vocal_path2 is not None and os.path.exists(temp_vocal_path2), "No vocal detected in audio 2"
+        temp_vocal_paths.append(temp_vocal_path2)
+        left_arr, right_arr, merged_raw = prepare_multi_audio(
+            temp_vocal_path, temp_vocal_path2, audio_path, audio_path2,
+            sr=sr, audio_type=audio_type,
+        )
+        person_speech_arrays = [left_arr, right_arr]
+        import soundfile as sf
+        mux_audio_path = os.path.join(output_dir, "merged_audio.wav")
+        sf.write(mux_audio_path, merged_raw, sr)
+        source_duration = len(left_arr) / sr
+    else:
+        speech_array, sr = librosa.load(temp_vocal_path, sr=sr)
+        person_speech_arrays = [speech_array]
+        mux_audio_path = audio_path
+        source_duration = len(speech_array) / sr
 
     if num_segments_auto:
         if source_duration * save_fps <= num_frames:
@@ -794,24 +879,41 @@ def generate(
     generate_duration = num_frames / save_fps + (n_seg - 1) * (num_frames - num_cond_frames) / save_fps
     added = math.ceil((generate_duration - source_duration) * sr)
     if added > 0:
-        speech_array = np.append(speech_array, [0.] * added)
+        person_speech_arrays = [np.append(a, [0.] * added) for a in person_speech_arrays]
     log(f"    audio {source_duration:.1f}s, target video {generate_duration:.1f}s "
         f"({n_seg} segment(s), {num_frames + (n_seg-1)*(num_frames-num_cond_frames)} frames)")
 
     audio_emb_compute_device = "cpu" if is_tpu else GS.dev0
-    with torch.no_grad():
-        full_audio_emb = pipe.get_audio_embedding(
-            speech_array, fps=save_fps * audio_stride, device=audio_emb_compute_device,
-            sample_rate=sr, model_type=model_type,
-        )
-    if torch.isnan(full_audio_emb).any():
-        yield None, "Broken audio embedding with NaN values.", []
-        return
-    full_audio_emb = full_audio_emb.float().cpu()
-    log(f"    audio embedding: {tuple(full_audio_emb.shape)}")
+    full_audio_embs = []
+    for pi, arr in enumerate(person_speech_arrays):
+        with torch.no_grad():
+            emb = pipe.get_audio_embedding(
+                arr, fps=save_fps * audio_stride, device=audio_emb_compute_device,
+                sample_rate=sr, model_type=model_type,
+            )
+        if torch.isnan(emb).any():
+            yield None, f"Broken audio embedding (person{pi+1}) with NaN values.", []
+            return
+        full_audio_embs.append(emb.float().cpu())
+        log(f"    audio embedding person{pi+1}: {tuple(emb.shape)}")
+    if multi_mode:
+        assert full_audio_embs[0].shape == full_audio_embs[1].shape, \
+            f"Inconsistent audio embedding shapes: {full_audio_embs[0].shape} vs {full_audio_embs[1].shape}"
 
-    if os.path.exists(temp_vocal_path):
-        os.remove(temp_vocal_path)
+    # --- ref_target_masks (multitalk): [3, H, W] = person1/person2/background ---
+    ref_target_masks = None
+    if multi_mode:
+        src_w, src_h = image.size
+        bbox = bbox or {}
+        ref_target_masks = build_ref_target_masks(
+            bbox.get("person1"), bbox.get("person2"), src_w, src_h,
+        ).to(device=audio_emb_device, dtype=torch.float32)
+        log(f"    ref_target_masks: {tuple(ref_target_masks.shape)} "
+            f"(bbox={'annotated' if bbox.get('person1') else 'auto left/right split'})")
+
+    for p in temp_vocal_paths:
+        if os.path.exists(p):
+            os.remove(p)
     torch_gc()
 
     # --- Stage 2: text encoding ---
@@ -831,11 +933,14 @@ def generate(
     torch_gc()
 
     # --- Audio slicing helper ---
+    # Single: [1, T, ...]; multitalk: [2, T, ...] (person1 + person2 stacked on batch)
     indices = torch.arange(2 * 2 + 1) - 2
     def slice_audio_emb(start, end):
         ci = torch.arange(start, end, audio_stride).unsqueeze(1) + indices.unsqueeze(0)
-        ci = torch.clamp(ci, min=0, max=full_audio_emb.shape[0] - 1)
-        return full_audio_emb[ci][None, ...].to(device=audio_emb_device, dtype=audio_emb_dtype)
+        ci = torch.clamp(ci, min=0, max=full_audio_embs[0].shape[0] - 1)
+        return torch.cat(
+            [emb[ci][None, ...] for emb in full_audio_embs]
+        ).to(device=audio_emb_device, dtype=audio_emb_dtype)
 
     # --- Generator ---
     generator = torch.Generator(device=gen_device)
@@ -859,6 +964,7 @@ def generate(
             num_frames=num_frames, num_inference_steps=num_inference_steps,
             text_guidance_scale=text_guidance_scale, audio_guidance_scale=audio_guidance_scale,
             generator=warmup_generator, output_type='both', audio_emb=warmup_audio_emb, use_distill=use_distill,
+            ref_target_masks=ref_target_masks,
         )
         with torch.no_grad():
             warm_image = load_image(img_path)
@@ -888,7 +994,7 @@ def generate(
                     enhance_hf=False,
                     audio_emb=warmup_audio_emb, ref_latent=warm_ref_latent,
                     ref_img_index=args.ref_img_index, mask_frame_range=args.mask_frame_range,
-                    use_distill=use_distill,
+                    use_distill=use_distill, ref_target_masks=ref_target_masks,
                 )
             del warm_ref_latent
         del warm_latent, warm_video
@@ -919,6 +1025,7 @@ def generate(
         num_frames=num_frames, num_inference_steps=num_inference_steps,
         text_guidance_scale=text_guidance_scale, audio_guidance_scale=audio_guidance_scale,
         generator=generator, output_type='both', audio_emb=audio_emb, use_distill=use_distill,
+        ref_target_masks=ref_target_masks,
     )
     _ai2v_q = _queue.Queue()
     def _run_ai2v():
@@ -950,7 +1057,7 @@ def generate(
     seg1_path = os.path.join(output_dir, "segment_1")
     save_video_ffmpeg(
         torch.from_numpy(np.array(video)),
-        seg1_path, audio_path, fps=save_fps, quality=5,
+        seg1_path, mux_audio_path, fps=save_fps, quality=5,
     )
     segment_paths.append(seg1_path + ".mp4")
     log(f"    segment 1 done in {(time.time()-t0)/60:.1f} min")
@@ -1002,7 +1109,7 @@ def generate(
                         enhance_hf=False,
                         audio_emb=audio_emb, ref_latent=_cur_ref,
                         ref_img_index=args.ref_img_index, mask_frame_range=args.mask_frame_range,
-                        use_distill=use_distill,
+                        use_distill=use_distill, ref_target_masks=ref_target_masks,
                     )
                 _avc_q.put(("ok", result))
             except Exception as _e:
@@ -1032,7 +1139,7 @@ def generate(
         seg_path = os.path.join(output_dir, f"video_continue_{segment_idx+1}")
         save_video_ffmpeg(
             torch.from_numpy(np.array(all_generated_frames)),
-            seg_path, audio_path, fps=save_fps, quality=5,
+            seg_path, mux_audio_path, fps=save_fps, quality=5,
         )
         segment_paths.append(seg_path + ".mp4")
         log(f"    segment {segment_idx+1} done in {(time.time()-t0)/60:.1f} min "
@@ -1043,7 +1150,7 @@ def generate(
     final_path = os.path.join(output_dir, "final_video")
     save_video_ffmpeg(
         torch.from_numpy(np.array(all_generated_frames)),
-        final_path, audio_path, fps=save_fps, quality=5,
+        final_path, mux_audio_path, fps=save_fps, quality=5,
     )
     final_video = final_path + ".mp4"
     log(f"[done] final video: {final_video} ({len(all_generated_frames)} frames)")
@@ -1178,6 +1285,69 @@ def _session_save_audio(sid, audio_path):
         print(f"[session] audio save failed: {e}", flush=True)
 
 
+def _session_save_audio2(sid, audio_path):
+    if not sid:
+        return
+    try:
+        for old in Path(_session_dir(sid)).glob("audio2.*"):
+            old.unlink(missing_ok=True)
+        if audio_path and os.path.exists(audio_path):
+            p = _session_path(sid, "audio2" + (os.path.splitext(audio_path)[1] or ".wav"))
+            shutil.copy(audio_path, p)
+            _session_save_json(sid, audio2=p)
+        else:
+            _session_save_json(sid, audio2=None)
+    except Exception as e:
+        print(f"[session] audio2 save failed: {e}", flush=True)
+
+
+# ---------------------------------------------------------------------------
+# BBox annotation (dual-speaker) — click two opposite corners per person
+# ---------------------------------------------------------------------------
+_BBOX_COLORS = {"person1": (255, 64, 64), "person2": (64, 96, 255)}
+
+
+def _empty_bbox_state():
+    return {"person1": {"points": [], "bbox": None},
+            "person2": {"points": [], "bbox": None}}
+
+
+def _draw_bbox_preview(image, state):
+    """Return a copy of `image` with person1/person2 boxes and pending points drawn."""
+    if image is None:
+        return None
+    from PIL import ImageDraw
+    img = image.convert("RGB").copy()
+    draw = ImageDraw.Draw(img)
+    lw = max(2, int(min(img.size) * 0.006))
+    for person, color in _BBOX_COLORS.items():
+        info = (state or {}).get(person) or {}
+        bbox = info.get("bbox")
+        if bbox:
+            x1, y1, x2, y2 = bbox
+            draw.rectangle([min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2)],
+                           outline=color, width=lw)
+            draw.text((min(x1, x2) + lw, min(y1, y2) + lw), person, fill=color)
+        for (px, py) in info.get("points", []):
+            r = lw * 2
+            draw.ellipse([px - r, py - r, px + r, py + r], outline=color, width=lw)
+    return img
+
+
+def _bbox_status_text(state):
+    parts = []
+    for person in ("person1", "person2"):
+        info = (state or {}).get(person) or {}
+        if info.get("bbox"):
+            x1, y1, x2, y2 = info["bbox"]
+            parts.append(f"{person}: [{x1}, {y1}, {x2}, {y2}]")
+        elif info.get("points"):
+            parts.append(f"{person}: \u5df2\u70b9 1 \u89d2\uff0c\u518d\u70b9\u5bf9\u89d2...")
+        else:
+            parts.append(f"{person}: \u672a\u6807\u6ce8")
+    return " | ".join(parts) + "\uff08\u4e24\u4eba\u90fd\u4e0d\u6807\u5219\u9ed8\u8ba4\u5de6\u53f3\u5bf9\u534a\u5206\uff09"
+
+
 # ---------------------------------------------------------------------------
 # Background jobs — generation keeps running even if the client disconnects;
 # re-attach any time with the session ID.
@@ -1186,14 +1356,16 @@ JOBS = {}  # sid -> {"status": "running"|"done"|"error", "video", "log", "segmen
 _GEN_LOCK = threading.Lock()  # single accelerator: one generation at a time
 
 
-def _run_job(sid, image, audio_path, prompt, resolution, num_segments, seed, negative_prompt=None):
+def _run_job(sid, image, audio_path, prompt, resolution, num_segments, seed,
+             negative_prompt=None, audio_path2=None, audio_type="para", bbox=None):
     job = JOBS[sid]
     if _GEN_LOCK.locked():
         job["log"] = "[queue] another job is running, waiting for it to finish..."
     with _GEN_LOCK:
         try:
             for video, log_text, segs in generate(
-                    image, audio_path, prompt, resolution, num_segments, seed, negative_prompt):
+                    image, audio_path, prompt, resolution, num_segments, seed, negative_prompt,
+                    audio_path2=audio_path2, audio_type=audio_type, bbox=bbox):
                 job["video"], job["log"], job["segments"] = video, log_text, list(segs)
                 _session_save_json(sid, job_video=video, job_log=log_text,
                                    job_segments=list(segs), job_status="running")
@@ -1207,31 +1379,51 @@ def _run_job(sid, image, audio_path, prompt, resolution, num_segments, seed, neg
             _session_save_json(sid, job_status="error", job_log=job["log"])
 
 
-def _start_or_attach(sid, image, audio_path, prompt, resolution, num_segments, seed, negative_prompt=None):
+_BEEP_SCRIPT = '<script>new Audio("data:audio/wav;base64,UklGRl9vT19XQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA=").play()</script>'
+
+
+def _start_or_attach(sid, image, audio_path, prompt, resolution, num_segments, seed,
+                     negative_prompt=None, mode="\u5355\u4eba", audio_path2=None,
+                     audio_type="para", bbox_state=None):
     """Start a background generation job for this session (or attach to a
     running one) and stream its progress. Safe to disconnect and re-attach."""
     sid = (sid or "").strip() or _new_session_id()
+    if mode != "\u53cc\u4eba":
+        audio_path2, bbox = None, None
+    else:
+        bs = bbox_state or {}
+        b1 = (bs.get("person1") or {}).get("bbox")
+        b2 = (bs.get("person2") or {}).get("bbox")
+        bbox = {"person1": b1, "person2": b2} if (b1 and b2) else None
     job = JOBS.get(sid)
     if job is None or job["status"] != "running":
         job = {"status": "running", "video": None, "log": "", "segments": []}
         JOBS[sid] = job
         threading.Thread(target=_run_job, daemon=True, name=f"job-{sid}",
                          args=(sid, image, audio_path, prompt,
-                               resolution, num_segments, seed, negative_prompt)).start()
+                               resolution, num_segments, seed, negative_prompt,
+                               audio_path2, audio_type, bbox)).start()
+    _prev_seg_count = len(job["segments"])
     while job["status"] == "running":
-        yield job["video"], job["log"], list(job["segments"])
+        cur_seg_count = len(job["segments"])
+        beep = _BEEP_SCRIPT if cur_seg_count > _prev_seg_count else ""
+        _prev_seg_count = cur_seg_count
+        yield job["video"], job["log"], list(job["segments"]), beep
         time.sleep(2)
-    yield job["video"], job["log"], list(job["segments"])
+    cur_seg_count = len(job["segments"])
+    beep = _BEEP_SCRIPT if cur_seg_count > _prev_seg_count else ""
+    yield job["video"], job["log"], list(job["segments"]), beep
 
 
 def _restore_session(sid):
     """Restore inputs + results for a session ID; if its job is still running,
-    keep streaming progress (re-attach). Yields 9 component updates."""
+    keep streaming progress (re-attach). Yields 14 component updates."""
     import gradio as gr
     sid = (sid or "").strip()
     noop = gr.update()
     if not sid or not os.path.isdir(os.path.join(SESSION_ROOT, sid)):
-        yield (noop,) * 9 + (gr.update(value=f"[session] '{sid}' not found"),)
+        yield (noop,) * 10 + (_empty_bbox_state(), noop, noop, noop,
+                              gr.update(value=f"[session] '{sid}' not found"))
         return
 
     data = _session_load_json(sid)
@@ -1240,6 +1432,16 @@ def _restore_session(sid):
     audio = data.get("audio")
     if audio and not os.path.exists(audio):
         audio = None
+    audio2 = data.get("audio2")
+    if audio2 and not os.path.exists(audio2):
+        audio2 = None
+    bbox_state = data.get("bbox_state") or _empty_bbox_state()
+    bbox_preview = None
+    if image and data.get("mode") == "\u53cc\u4eba":
+        try:
+            bbox_preview = _draw_bbox_preview(PIL.Image.open(img_p), bbox_state)
+        except Exception:
+            bbox_preview = None
     inputs = (
         gr.update(value=image) if image else noop,
         gr.update(value=audio) if audio else noop,
@@ -1248,8 +1450,14 @@ def _restore_session(sid):
         gr.update(value=data["segments"]) if data.get("segments") else noop,
         gr.update(value=data["seed"]) if data.get("seed") is not None else noop,
         gr.update(value=data["negative_prompt"]) if data.get("negative_prompt") else noop,
+        gr.update(value=data["mode"]) if data.get("mode") else noop,
+        gr.update(value=audio2) if audio2 else noop,
+        gr.update(value=data["audio_type"]) if data.get("audio_type") else noop,
+        bbox_state,
+        gr.update(value=bbox_preview) if bbox_preview else noop,
     )
-    no_inputs = (noop,) * 7
+    # gr.State outputs need a real value (gr.update() is for UI components only)
+    no_inputs = (noop,) * 10 + (bbox_state, noop)
 
     job = JOBS.get(sid)
     if job and job["status"] == "running":
@@ -1314,8 +1522,30 @@ def build_ui():
 
         with gr.Row():
             with gr.Column(scale=1):
-                input_image = gr.Image(label="Reference Image", type="pil", height=300)
-                input_audio = gr.Audio(label="Speech Audio", type="filepath")
+                mode_radio = gr.Radio(
+                    ["\u5355\u4eba", "\u53cc\u4eba"], value="\u5355\u4eba", label="\u6a21\u5f0f",
+                    info="\u53cc\u4eba\uff1a\u4e0a\u4f20\u4e24\u6bb5\u97f3\u9891\uff0c\u53ef\u5728\u53c2\u8003\u56fe\u4e0a\u6807\u6ce8\u4e24\u4eba\u4f4d\u7f6e",
+                )
+                input_image = gr.Image(label="Reference Image\uff08\u53cc\u4eba\u6a21\u5f0f\u4e0b\u70b9\u51fb\u56fe\u7247\u6807\u6ce8 BBox\uff09", type="pil", height=300)
+                input_audio = gr.Audio(label="Speech Audio (Person 1)", type="filepath")
+                with gr.Group(visible=False) as multi_group:
+                    input_audio2 = gr.Audio(label="Speech Audio (Person 2)", type="filepath")
+                    audio_type_radio = gr.Radio(
+                        choices=[("para \u2014 \u4e24\u4eba\u540c\u65f6\u8bf4\uff08\u97f3\u9891\u53e0\u52a0\uff09", "para"),
+                                 ("add \u2014 \u8f6e\u6d41\u8bf4\uff08Person1 \u5148\u3001Person2 \u540e\uff09", "add")],
+                        value="para", label="Audio Type",
+                    )
+                    person_sel = gr.Radio(
+                        ["person1", "person2"], value="person1", label="\u5f53\u524d\u6807\u6ce8\u5bf9\u8c61",
+                        info="\u5728\u4e0a\u65b9\u53c2\u8003\u56fe\u4e0a\u70b9\u51fb\u77e9\u5f62\u7684\u4e24\u4e2a\u5bf9\u89d2 \u2014 person1 \u7ea2\u6846 / person2 \u84dd\u6846",
+                    )
+                    bbox_preview = gr.Image(label="BBox \u9884\u89c8", interactive=False, height=220)
+                    bbox_info = gr.Textbox(label="BBox \u72b6\u6001", interactive=False,
+                                           value="person1: \u672a\u6807\u6ce8 | person2: \u672a\u6807\u6ce8\uff08\u4e24\u4eba\u90fd\u4e0d\u6807\u5219\u9ed8\u8ba4\u5de6\u53f3\u5bf9\u534a\u5206\uff09")
+                    with gr.Row():
+                        clear_p1_btn = gr.Button("\u6e05\u9664 Person1 \u6846", size="sm")
+                        clear_p2_btn = gr.Button("\u6e05\u9664 Person2 \u6846", size="sm")
+                bbox_state = gr.State(_empty_bbox_state())
                 prompt_text = gr.Textbox(
                     label="Prompt",
                     value="A western man stands on stage under dramatic lighting, holding a microphone close to their mouth. Wearing a vibrant red jacket with gold embroidery, the singer is speaking while smoke swirls around them, creating a dynamic and atmospheric scene.",
@@ -1365,6 +1595,53 @@ def build_ui():
 
         _beep_html = gr.HTML("", visible=False, elem_id="beep-trigger")
 
+        # --- Dual-speaker mode: show/hide the second-audio + bbox group ---
+        mode_radio.change(
+            fn=lambda m: gr.update(visible=(m == "\u53cc\u4eba")),
+            inputs=mode_radio, outputs=multi_group,
+        )
+
+        # --- BBox annotation: click two opposite corners on the reference image ---
+        def _on_image_click(state, person, image, sid, evt: gr.SelectData):
+            state = state or _empty_bbox_state()
+            if image is None or evt is None:
+                return state, gr.update(), gr.update()
+            x, y = int(evt.index[0]), int(evt.index[1])
+            info = state.setdefault(person, {"points": [], "bbox": None})
+            info["points"].append([x, y])
+            if len(info["points"]) >= 2:
+                (x1, y1), (x2, y2) = info["points"][:2]
+                info["bbox"] = [min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2)]
+                info["points"] = []
+            if sid:
+                _session_save_json(sid, bbox_state=state)
+            return state, _draw_bbox_preview(image, state), _bbox_status_text(state)
+
+        input_image.select(
+            fn=_on_image_click,
+            inputs=[bbox_state, person_sel, input_image, sid_box],
+            outputs=[bbox_state, bbox_preview, bbox_info],
+        )
+
+        def _clear_person(state, image, sid, person):
+            state = state or _empty_bbox_state()
+            state[person] = {"points": [], "bbox": None}
+            if sid:
+                _session_save_json(sid, bbox_state=state)
+            preview = _draw_bbox_preview(image, state) if image is not None else None
+            return state, preview, _bbox_status_text(state)
+
+        clear_p1_btn.click(
+            fn=lambda s, img, sid: _clear_person(s, img, sid, "person1"),
+            inputs=[bbox_state, input_image, sid_box],
+            outputs=[bbox_state, bbox_preview, bbox_info],
+        )
+        clear_p2_btn.click(
+            fn=lambda s, img, sid: _clear_person(s, img, sid, "person2"),
+            inputs=[bbox_state, input_image, sid_box],
+            outputs=[bbox_state, bbox_preview, bbox_info],
+        )
+
         # --- Session persistence: save inputs (per session ID) as they change ---
         input_image.change(fn=_session_save_image, inputs=[sid_box, input_image])
         input_audio.change(fn=_session_save_audio, inputs=[sid_box, input_audio])
@@ -1378,9 +1655,16 @@ def build_ui():
                            inputs=[sid_box, seed_slider])
         neg_prompt_text.change(fn=lambda s, v: _session_save_json(s, negative_prompt=v) if s else None,
                                inputs=[sid_box, neg_prompt_text])
+        mode_radio.change(fn=lambda s, v: _session_save_json(s, mode=v) if s else None,
+                          inputs=[sid_box, mode_radio])
+        input_audio2.change(fn=_session_save_audio2, inputs=[sid_box, input_audio2])
+        audio_type_radio.change(fn=lambda s, v: _session_save_json(s, audio_type=v) if s else None,
+                                inputs=[sid_box, audio_type_radio])
 
         _restore_outputs = [input_image, input_audio, prompt_text, res_dd, seg_dd,
-                            seed_slider, neg_prompt_text, output_video, segment_gallery, log_box]
+                            seed_slider, neg_prompt_text, mode_radio, input_audio2,
+                            audio_type_radio, bbox_state, bbox_preview,
+                            output_video, segment_gallery, log_box]
 
         # On (re)load: pick up the most recent session (or create one), then
         # restore it — including re-attaching to a still-running generation.
@@ -1399,11 +1683,9 @@ def build_ui():
 
         generate_btn.click(
             fn=_start_or_attach,
-            inputs=[sid_box, input_image, input_audio, prompt_text, res_dd, seg_dd, seed_slider, neg_prompt_text],
-            outputs=[output_video, log_box, segment_gallery],
-        ).then(
-            fn=lambda: '<script>new Audio("data:audio/wav;base64,UklGRl9vT19XQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA=").play()</script>',
-            outputs=_beep_html,
+            inputs=[sid_box, input_image, input_audio, prompt_text, res_dd, seg_dd, seed_slider,
+                    neg_prompt_text, mode_radio, input_audio2, audio_type_radio, bbox_state],
+            outputs=[output_video, log_box, segment_gallery, _beep_html],
         )
 
         # Periodic status update via Timer (Gradio 6.0+)

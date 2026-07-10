@@ -19,8 +19,9 @@ from ..context_parallel import context_parallel_util
 
 
 def torch_gc():
-    torch.cuda.empty_cache()
-    torch.cuda.ipc_collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
 
 
 def linear_interpolation(features, seq_len):
@@ -29,7 +30,6 @@ def linear_interpolation(features, seq_len):
     return output_features.transpose(1, 2)
 
 
-@torch.compile
 def calculate_x_ref_attn_map(noise_q, ref_k, ref_target_masks, attn_bias=None):
 
     # compute cross-reference attention maps between query features and reference key features.
@@ -65,6 +65,12 @@ def calculate_x_ref_attn_map(noise_q, ref_k, ref_target_masks, attn_bias=None):
     torch_gc()
 
     return torch.concat(x_ref_attn_maps, dim=0)
+
+
+# torch.compile only helps on CUDA (inductor); on XLA/TPU it either fails or
+# fights the lazy-tensor tracer, so keep the eager version there.
+if torch.cuda.is_available():
+    calculate_x_ref_attn_map = torch.compile(calculate_x_ref_attn_map)
 
 
 def get_attn_map_with_target(noise_q, key, shape, ref_target_masks=None, split_num=2, cp_split_hw=None):

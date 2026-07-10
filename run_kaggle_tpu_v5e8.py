@@ -372,6 +372,14 @@ def main():
         "many people in the background, walking backwards"
     )
     raw_speech_path = input_data['cond_audio']['person1']
+    raw_speech_path2 = input_data['cond_audio'].get('person2', None)
+    multi_mode = raw_speech_path2 is not None
+    audio_type = input_data.get('audio_type', 'para')
+    bbox_cfg = input_data.get('bbox', None)
+    if multi_mode:
+        assert args.stage_1 == 'ai2v', "multitalk (dual-speaker) requires --stage_1 ai2v"
+        print(f"[multitalk] dual-speaker mode: audio_type={audio_type} "
+              f"bbox={'yes' if bbox_cfg else 'auto left/right split'}", flush=True)
 
     from transformers import AutoTokenizer, UMT5EncoderModel
     from diffusers.utils import load_image
@@ -655,11 +663,33 @@ def main():
         vocal_separator, audio_tmp_dir,
     )
     assert temp_vocal_path is not None and os.path.exists(temp_vocal_path), "No vocal detected"
+
+    sr = 16000
+    temp_vocal_paths = [temp_vocal_path]
+    if multi_mode:
+        temp_vocal_path2 = extract_vocal_from_speech(
+            raw_speech_path2, f"/tmp/temp_speech_{generate_random_uid()}_vocal2.wav",
+            vocal_separator, audio_tmp_dir,
+        )
+        assert temp_vocal_path2 is not None and os.path.exists(temp_vocal_path2), "No vocal detected in person2 audio"
+        temp_vocal_paths.append(temp_vocal_path2)
+        from gradio_server import prepare_multi_audio
+        left_arr, right_arr, merged_raw = prepare_multi_audio(
+            temp_vocal_path, temp_vocal_path2, raw_speech_path, raw_speech_path2,
+            sr=sr, audio_type=audio_type,
+        )
+        person_speech_arrays = [left_arr, right_arr]
+        import soundfile as sf
+        mux_audio_path = os.path.join(args.output_dir, "merged_audio.wav")
+        sf.write(mux_audio_path, merged_raw, sr)
+        source_duration = len(left_arr) / sr
+    else:
+        speech_array, sr = librosa.load(temp_vocal_path, sr=sr)
+        person_speech_arrays = [speech_array]
+        mux_audio_path = raw_speech_path
+        source_duration = len(person_speech_arrays[0]) / sr
     del vocal_separator
     gc.collect()
-
-    speech_array, sr = librosa.load(temp_vocal_path, sr=16000)
-    source_duration = len(speech_array) / sr
 
     if num_segments_auto:
         # generate_duration = num_frames/fps + (N-1)*(num_frames-num_cond_frames)/fps >= source_duration
@@ -674,7 +704,7 @@ def main():
     generate_duration = num_frames / save_fps + (num_segments - 1) * (num_frames - num_cond_frames) / save_fps
     added = math.ceil((generate_duration - source_duration) * sr)
     if added > 0:
-        speech_array = np.append(speech_array, [0.] * added)
+        person_speech_arrays = [np.append(a, [0.] * added) for a in person_speech_arrays]
     print(f"    audio {source_duration:.1f}s, target video {generate_duration:.1f}s "
           f"({num_segments} segment(s), {num_frames + (num_segments-1)*(num_frames-num_cond_frames)} frames)")
 
@@ -689,20 +719,25 @@ def main():
     )
     pipe.device = xla_dev  # DiT device; VAE bridging is handled inside the pipeline
 
-    with torch.no_grad():
-        full_audio_emb = pipe.get_audio_embedding(
-            speech_array, fps=save_fps * audio_stride, device="cpu",
-            sample_rate=sr, model_type=model_type,
-        )
-    if torch.isnan(full_audio_emb).any():
-        raise ValueError("broken audio embedding with nan values")
-    full_audio_emb = full_audio_emb.float().cpu()
-    print(f"    audio embedding: {tuple(full_audio_emb.shape)}")
+    full_audio_embs = []
+    for pi, arr in enumerate(person_speech_arrays):
+        with torch.no_grad():
+            emb = pipe.get_audio_embedding(
+                arr, fps=save_fps * audio_stride, device="cpu",
+                sample_rate=sr, model_type=model_type,
+            )
+        if torch.isnan(emb).any():
+            raise ValueError(f"broken audio embedding (person{pi+1}) with nan values")
+        full_audio_embs.append(emb.float().cpu())
+        print(f"    audio embedding person{pi+1}: {tuple(emb.shape)}")
+    if multi_mode:
+        assert full_audio_embs[0].shape == full_audio_embs[1].shape, "Inconsistent audio embedding shape"
 
     pipe.audio_encoder = None
     del audio_encoder
-    if os.path.exists(temp_vocal_path):
-        os.remove(temp_vocal_path)
+    for p in temp_vocal_paths:
+        if os.path.exists(p):
+            os.remove(p)
     torch_gc()
     log_mem("audio done")
 
@@ -958,10 +993,31 @@ def main():
     audio_start_idx = 0
     audio_end_idx = audio_start_idx + audio_stride * num_frames
 
+    # Single: [1, T, ...]; multitalk: [2, T, ...] (person1 + person2 stacked on batch)
     def slice_audio_emb(start, end):
         ci = torch.arange(start, end, audio_stride).unsqueeze(1) + indices.unsqueeze(0)
-        ci = torch.clamp(ci, min=0, max=full_audio_emb.shape[0] - 1)
-        return full_audio_emb[ci][None, ...].to(device=xla_dev, dtype=torch.bfloat16)
+        ci = torch.clamp(ci, min=0, max=full_audio_embs[0].shape[0] - 1)
+        return torch.cat(
+            [emb[ci][None, ...] for emb in full_audio_embs]
+        ).to(device=xla_dev, dtype=torch.bfloat16)
+
+    # --- ref_target_masks (multitalk): [3, H, W] = person1/person2/background ---
+    ref_target_masks = None
+    if multi_mode:
+        from gradio_server import build_ref_target_masks
+        cond_img = PIL.Image.open(input_data['cond_image'])
+        src_w, src_h = cond_img.size
+        bbox_p1 = bbox_p2 = None
+        if bbox_cfg:
+            # official json bbox order: [y_min, x_min, y_max, x_max]
+            b1 = bbox_cfg.get('person1')
+            b2 = bbox_cfg.get('person2')
+            if b1 and b2:
+                bbox_p1 = [b1[1], b1[0], b1[3], b1[2]]  # -> [x1, y1, x2, y2]
+                bbox_p2 = [b2[1], b2[0], b2[3], b2[2]]
+        ref_target_masks = build_ref_target_masks(bbox_p1, bbox_p2, src_w, src_h)
+        ref_target_masks = ref_target_masks.to(device=xla_dev, dtype=torch.float32)
+        print(f"[multitalk] ref_target_masks: {tuple(ref_target_masks.shape)}", flush=True)
 
     # =====================================================================
     # WARMUP — compile every graph on throwaway data, kept OUT of the timed
@@ -988,6 +1044,8 @@ def main():
             text_guidance_scale=text_guidance_scale, audio_guidance_scale=audio_guidance_scale,
             generator=warmup_generator, output_type='both', audio_emb=warmup_audio_emb, use_distill=use_distill,
         )
+        if args.stage_1 == 'ai2v':
+            common_warmup['ref_target_masks'] = ref_target_masks
         with torch.no_grad():
             if args.stage_1 == 'at2v':
                 warm_output, warm_latent = pipe.generate_at2v(height=height, width=width, **common_warmup)
@@ -1014,7 +1072,7 @@ def main():
                     enhance_hf=False,
                     audio_emb=warmup_audio_emb, ref_latent=warm_ref_latent,
                     ref_img_index=args.ref_img_index, mask_frame_range=args.mask_frame_range,
-                    use_distill=use_distill,
+                    use_distill=use_distill, ref_target_masks=ref_target_masks,
                 )
             del warm_ref_latent
 
@@ -1063,6 +1121,8 @@ def main():
             text_guidance_scale=text_guidance_scale, audio_guidance_scale=audio_guidance_scale,
             generator=generator, output_type='both', audio_emb=audio_emb, use_distill=use_distill,
         )
+        if args.stage_1 == 'ai2v':
+            common['ref_target_masks'] = ref_target_masks
         with torch.no_grad():
             if args.stage_1 == 'at2v':
                 output, latent = pipe.generate_at2v(height=height, width=width, **common)
@@ -1078,7 +1138,7 @@ def main():
         save_video_ffmpeg(
             torch.from_numpy(np.array(video)),
             os.path.join(args.output_dir, f"{args.stage_1}_segment_1"),
-            raw_speech_path, fps=save_fps, quality=5,
+            mux_audio_path, fps=save_fps, quality=5,
         )
         print(f"    segment 1 done in {(time.time()-t0)/60:.1f} min", flush=True)
         print(f"[shape] actual video size={video[0].size} latent={tuple(latent.shape)} "
@@ -1148,7 +1208,7 @@ def main():
                 enhance_hf=False,  # distill mode: must be off
                 audio_emb=audio_emb, ref_latent=ref_latent,
                 ref_img_index=args.ref_img_index, mask_frame_range=args.mask_frame_range,
-                use_distill=use_distill,
+                use_distill=use_distill, ref_target_masks=ref_target_masks,
             )
 
         output = output[0]
@@ -1164,7 +1224,7 @@ def main():
         save_video_ffmpeg(
             torch.from_numpy(np.array(all_generated_frames)),
             os.path.join(args.output_dir, f"video_continue_{segment_idx+1}"),
-            raw_speech_path, fps=save_fps, quality=5,
+            mux_audio_path, fps=save_fps, quality=5,
         )
         print(f"    segment {segment_idx+1} done in {(time.time()-t0)/60:.1f} min "
               f"(total {len(all_generated_frames)} frames = {len(all_generated_frames)/save_fps:.1f} s)", flush=True)
